@@ -1,0 +1,52 @@
+
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/vite.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Remix Nectar Injector v0.0.21</title>
+    <meta name="description" content="An intelligent image processing tool to arrange, overlay, and modify images on a canvas. Features AI-powered commands for layout management and AI-generated overlays." />
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+  <script type="importmap">
+{
+  "imports": {
+    "react/": "https://aistudiocdn.com/react@^19.1.1/",
+    "react": "https://aistudiocdn.com/react@^19.1.1",
+    "react-dom/": "https://aistudiocdn.com/react-dom@^19.1.1/",
+    "@google/genai": "https://aistudiocdn.com/@google/genai@^1.20.0",
+    "path": "https://esm.sh/path@^0.12.7",
+    "vite": "https://esm.sh/vite@^7.3.0",
+    "@vitejs/plugin-react": "https://esm.sh/@vitejs/plugin-react@^5.1.2",
+    "url": "https://esm.sh/url@^0.11.4"
+  }
+}
+</script>
+
+<style>
+  #main-canvas-container,
+  #main-canvas-container canvas:not([style*="image-rendering: auto"]),
+  #main-canvas-container img,
+  .image-pixelated {
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-optimize-contrast;
+    image-rendering: crisp-edges;
+    image-rendering: pixelated;
+  }
+</style>
+</head>
+  <body class="bg-slate-900 text-slate-200">
+    <div id="root"></div>
+    <!-- SVG Filters for Real-time Effects -->
+    <svg style="position: absolute; width: 0; height: 0; overflow: hidden;" aria-hidden="true">
+      <defs>
+        <filter id="sharpen-effect">
+          <feConvolveMatrix order="3" kernelMatrix="0 -1 0 -1 5 -1 0 -1 0" preserveAlpha="true"/>
+        </filter>
+        <!-- Dynamic sharpen filters can be added here if needed, but a single strong sharpen is usually enough for preview -->
+      </defs>
+    </svg>
+    <script type="module" src="/index.tsx"></script>
+  </body>
+</html>

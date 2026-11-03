@@ -1,0 +1,383 @@
+========================================================================================
+COMMAND & CONQUER (TIBERIAN SUN / RED ALERT 2) TMP SPECIFICATION & IMPLEMENTATION HANDBOOK
+========================================================================================
+
+Complete technical documentation on binary structures, diamond geometry, isometric 
+grid math, height elevation, multi-tile rendering, snapping, and canvas editing for .TMP terrain files.
+
+----------------------------------------------------------------------------------------
+TABLE OF CONTENTS
+----------------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & TMP ARCHITECTURE
+2. BINARY SCHEMA & SPECIFICATION
+   2.1 Global Header (32-bit & 16-bit Variants)
+   2.2 Tile Index Offsets Table
+   2.3 Per-Tile Header Structure
+3. WESTWOOD ISOMETRIC DIAMOND GEOMETRY
+   3.1 Standard Tile Dimensions (48x24 and 60x30)
+   3.2 Diamond Scanline Structure (Decoding & Encoding)
+   3.3 The Diamond Hit-Test Algorithm (isInsideWestwoodDiamond)
+4. ISOMETRIC GRID & SNAPPING MATHEMATICS
+   4.1 Grid to Screen Projection (gx, gy -> screenX, screenY)
+   4.2 Screen to Grid Inverse Projection (screenX, screenY -> gx, gy)
+   4.3 Multi-Block Tile Origin & Bounding Box Normalization
+   4.4 Seamless Adjacent File Snapping in Canvas
+5. ELEVATION, CLIFFS & EXTRA DATA
+   5.1 Height Level Multiplier (Elevation Offset)
+   5.2 Extra Image Data (Cliffs, Slopes, Overhangs)
+   5.3 Z-Buffer & Damaged Data
+6. RENDERING & SORTING ORDER
+   6.1 Isometric Back-to-Front Depth Sorting (Z-Order)
+   6.2 Precise Pixel Picking & Overlap Resolution
+7. CANVAS DRAWING & CROSS-TILE TOOLS
+   7.1 Continuous Multi-Tile Brush & Clone Painting
+   7.2 Diamond Selection Outlines & Visual Bounds
+8. ENCODING & EXPORTING VALID TMP FILES
+
+
+========================================================================================
+1. EXECUTIVE SUMMARY & TMP ARCHITECTURE
+========================================================================================
+Command & Conquer: Tiberian Sun and Red Alert 2 use .TMP files to store isometric terrain 
+tiles (grass, water, roads, cliffs, shorelines, bridges, ramps, pavement, and rough ground).
+
+Unlike regular flat 2D tilemaps:
+- TMP files represent isometric blocks arranged in a grid of cblocks_x by cblocks_y.
+- Each individual tile has a 2:1 diamond footprint (typically 48 pixels wide by 24 pixels 
+  high in Tiberian Sun and Red Alert 2; or 60x30 in high-resolution variants).
+- Inside a tile, only pixels inside the diamond form the walkable terrain surface.
+- A tile can also possess an "Extra Image" (cliffs, walls, vertical drops) that draws 
+  outside the diamond base.
+- Tiles support "Height" levels where terrain is vertically raised by steps of (cy / 2).
+
+
+========================================================================================
+2. BINARY SCHEMA & SPECIFICATION
+========================================================================================
+TMP files are encoded in Little-Endian byte order.
+
+----------------------------------------------------------------------------------------
+2.1 GLOBAL HEADER
+----------------------------------------------------------------------------------------
+In standard 32-bit Tiberian Sun / Red Alert 2 TMP files, the header is 16 bytes:
+
+Offset (Bytes) | Data Type | Field Name | Description
+----------------------------------------------------------------------------------------
+0..3           | int32     | cblocks_x  | Grid width in tile blocks
+4..7           | int32     | cblocks_y  | Grid height in tile blocks
+8..11          | int32     | cx         | Tile width in pixels (typically 48 or 60)
+12..15         | int32     | cy         | Tile height in pixels (typically 24 or 30)
+
+* Note on 16-bit variant (Red Alert 1 / Tiberian Dawn style):
+Header size is 8 bytes: cx (uint16), cy (uint16), cblocks_x (uint16), cblocks_y (uint16).
+
+
+----------------------------------------------------------------------------------------
+2.2 TILE INDEX OFFSETS TABLE
+----------------------------------------------------------------------------------------
+Immediately following the global header is a table of 32-bit file pointers:
+- Total entries: (cblocks_x * cblocks_y)
+- Each entry is a uint32 offset pointing to the start of the Tile Header for that slot.
+- An offset value of 0 indicates an empty slot (no tile data present for that block).
+
+
+----------------------------------------------------------------------------------------
+2.3 PER-TILE HEADER STRUCTURE
+----------------------------------------------------------------------------------------
+Each tile starts with a header (typically 44 to 52 bytes depending on version):
+
+Offset (Bytes) | Data Type | Field Name     | Description
+----------------------------------------------------------------------------------------
+0..3           | int32     | x              | X offset within composite image
+4..7           | int32     | y              | Y offset within composite image
+8..11          | uint32    | extra_ofs      | File offset to Extra Image data (0 if none)
+12..15         | uint32    | z_ofs          | File offset to Z-Buffer data (0 if none)
+16..19         | uint32    | extra_z_ofs    | File offset to Extra Z data (0 if none)
+20..23         | int32     | x_extra        | X offset for Extra Image
+24..27         | int32     | y_extra        | Y offset for Extra Image
+28..31         | uint32    | cx_extra       | Width of Extra Image (pixels)
+32..35         | uint32    | cy_extra       | Height of Extra Image (pixels)
+36             | uint8     | flags          | Tile attribute flags (e.g. damaged, anim)
+37             | uint8     | height         | Elevation level (0 = flat ground, 1 = 1 level up, etc.)
+38             | uint8     | land_type      | Terrain type (Clear, Rough, Sand, Road, Water, etc.)
+39             | uint8     | ramp_type      | Slope/Ramp index (0 = flat, 1..n = slopes)
+40..42         | uint8[3]  | radar_colors   | Minimap / Radar RGB color (or color indices)
+43+            | varies    | extra fields   | Optional padding or sub-headers
+
+
+========================================================================================
+3. WESTWOOD ISOMETRIC DIAMOND GEOMETRY
+========================================================================================
+
+----------------------------------------------------------------------------------------
+3.1 STANDARD TILE DIMENSIONS
+----------------------------------------------------------------------------------------
+For Tiberian Sun / Red Alert 2:
+- Base Width  (cx) = 48 pixels
+- Base Height (cy) = 24 pixels
+- Aspect Ratio = 2:1 isometric projection
+
+Half dimensions:
+- halfW = cx / 2 = 24
+- halfH = cy / 2 = 12
+
+A raw 48x24 rectangle has 1,152 pixels. However, the diamond inside it uses exactly 
+(cx * cy) / 2 = 576 active bytes in the packed file.
+
+
+----------------------------------------------------------------------------------------
+3.2 DIAMOND SCANLINE STRUCTURE (DECODING & ENCODING)
+----------------------------------------------------------------------------------------
+The diamond starts at the top center and expands outward symmetrically by 4 pixels 
+per row (2 pixels left, 2 pixels right) until it reaches the midpoint, then shrinks:
+
+Top Half (y from 0 to halfH - 1, i.e., y = 0 to 11):
+- Row width: cx_row = (y + 1) * 4
+- Start X:   x_start = halfW - (y + 1) * 2
+
+Example for 48x24:
+- y = 0:  x_start = 22, width = 4   (pixels 22..25)
+- y = 1:  x_start = 20, width = 8   (pixels 20..27)
+- y = 2:  x_start = 18, width = 12  (pixels 18..29)
+...
+- y = 11: x_start = 0,  width = 48  (pixels 0..47)
+
+Bottom Half (y from halfH to cy - 1, i.e., y = 12 to 23):
+- Row width: cx_row decreases by 4 per line
+- Start X:   x_start increases by 2 per line
+
+Example:
+- y = 12: x_start = 0,  width = 48  (pixels 0..47)
+- y = 13: x_start = 2,  width = 44  (pixels 2..45)
+...
+- y = 23: x_start = 22, width = 4   (pixels 22..25)
+
+
+----------------------------------------------------------------------------------------
+3.3 THE DIAMOND HIT-TEST ALGORITHM (isInsideWestwoodDiamond)
+----------------------------------------------------------------------------------------
+To determine if local pixel (lx, ly) inside a (cx x cy) bounding box falls inside 
+the true diamond:
+
+```typescript
+function isInsideWestwoodDiamond(lx: number, ly: number, cx: number, cy: number): boolean {
+  if (lx < 0 || lx >= cx || ly < 0 || ly >= cy) return false;
+  const halfW = Math.floor(cx / 2);
+  const halfH = Math.floor(cy / 2);
+  
+  let ry: number;
+  if (ly < halfH) {
+    ry = ly;
+  } else {
+    ry = cy - 1 - ly; // Symmetric reflection for bottom half
+  }
+  if (ry < 0) return false;
+
+  const xOffset = halfW - (ry + 1) * 2;
+  const cxRow = (ry + 1) * 4;
+  return lx >= xOffset && lx < xOffset + cxRow;
+}
+```
+
+
+========================================================================================
+4. ISOMETRIC GRID & SNAPPING MATHEMATICS
+========================================================================================
+
+----------------------------------------------------------------------------------------
+4.1 GRID TO SCREEN PROJECTION (gx, gy -> screenX, screenY)
+----------------------------------------------------------------------------------------
+Given integer grid coordinates (gx, gy) on an isometric board:
+
+```typescript
+const halfW = cellW / 2; // e.g. 24
+const halfH = cellH / 2; // e.g. 12
+
+const screenX = mapCenterX + (gx - gy) * halfW;
+const screenY = mapCenterY + (gx + gy) * halfH;
+```
+
+Properties:
+- Moving +1 along X (gx + 1): moves right by +24px and down by +12px (+halfW, +halfH)
+- Moving +1 along Y (gy + 1): moves left by -24px and down by +12px (-halfW, +halfH)
+- Adjacent tiles touch seamlessly along 4 diagonal diamond borders without gaps.
+
+
+----------------------------------------------------------------------------------------
+4.2 SCREEN TO GRID INVERSE PROJECTION (screenX, screenY -> gx, gy)
+----------------------------------------------------------------------------------------
+To convert screen mouse coordinates (sx, sy) back to the integer grid cell (gx, gy):
+
+```typescript
+const relX = sx - mapCenterX;
+const relY = sy - mapCenterY;
+
+const u = relX / (cellW / 2);
+const v = relY / (cellH / 2);
+
+const gx = Math.floor((v + u) / 2);
+const gy = Math.floor((v - u) / 2);
+```
+
+This maps any screen point directly to the enclosing isometric diamond tile.
+
+
+----------------------------------------------------------------------------------------
+4.3 MULTI-BLOCK TILE ORIGIN & BOUNDING BOX NORMALIZATION
+----------------------------------------------------------------------------------------
+A multi-block TMP file (e.g. 3x3 tiles) contains multiple tile headers with their own 
+internal offsets (h.x, h.y) and elevation levels (h.height).
+
+To render the TMP file as a single coherent cached image:
+1. Find minX and minY across all active tiles in the file:
+   For each tile:
+     elev = tile.header.height * (cellH / 2)
+     minX = min(minX, tile.header.x)
+     minY = min(minY, tile.header.y - elev)
+     if (tile.header.has_extra_data):
+       minX = min(minX, tile.header.x_extra)
+       minY = min(minY, tile.header.y_extra - elev)
+
+2. Position each tile inside the cached buffer at:
+   drawX = tile.header.x - minX
+   drawY = tile.header.y - elev - minY
+
+3. Position the overall TMP asset on the map canvas at:
+   screenLeft = mapCenterX + (gx - gy) * halfW + minX
+   screenTop  = mapCenterY + (gx + gy) * halfH + minY
+
+This ensures multi-block tiles and cliff structures align pixel-perfectly with the grid.
+
+
+----------------------------------------------------------------------------------------
+4.4 SEAMLESS ADJACENT FILE SNAPPING IN CANVAS
+----------------------------------------------------------------------------------------
+When placing multiple distinct TMP files next to each other on the canvas:
+- Tile A placed at (gx: 10, gy: 10)
+- Tile B placed at (gx: 11, gy: 10) (adjacent in +X direction)
+- Tile C placed at (gx: 10, gy: 11) (adjacent in +Y direction)
+
+Because the grid coordinates drive placement using `(gx - gy) * halfW` and `(gx + gy) * halfH`, 
+adjacent tiles snap together with zero seams or overlap gaps.
+
+
+========================================================================================
+5. ELEVATION, CLIFFS & EXTRA DATA
+========================================================================================
+
+----------------------------------------------------------------------------------------
+5.1 HEIGHT LEVEL MULTIPLIER (ELEVATION OFFSET)
+----------------------------------------------------------------------------------------
+Tiberian Sun / RA2 terrain supports discrete height levels (0 to 15+):
+- Each unit of height lifts the diamond vertically upwards by (cellH / 2) pixels (12px).
+- Height Offset: `elev = header.height * (cellH / 2)`
+- Visual Y position: `screenY = baseY - elev`
+
+When a tile is on a cliff top with height = 2, its diamond is rendered 24 pixels 
+higher than the ground level.
+
+
+----------------------------------------------------------------------------------------
+5.2 EXTRA IMAGE DATA (CLIFFS, SLOPES, OVERHANGS)
+----------------------------------------------------------------------------------------
+When `header.has_extra_data` is true:
+- An additional rectangular graphic is stored at `extra_ofs` in the file.
+- Width = `cx_extra`, Height = `cy_extra`.
+- Position = `(x_extra, y_extra)` relative to the tile's base origin.
+- Used to draw vertical cliff faces connecting low-elevation ground to high-elevation ground.
+- In Extra Images, color index 0 is transparent.
+
+
+----------------------------------------------------------------------------------------
+5.3 Z-BUFFER & DAMAGED DATA
+----------------------------------------------------------------------------------------
+- Z-Data: Depth map values for accurate 3D voxel unit occlusion behind terrain peaks.
+- Damaged Data: Alternate textures displayed when terrain takes crater or blast damage.
+
+
+========================================================================================
+6. RENDERING & SORTING ORDER
+========================================================================================
+
+----------------------------------------------------------------------------------------
+6.1 ISOMETRIC BACK-TO-FRONT DEPTH SORTING (Z-ORDER)
+----------------------------------------------------------------------------------------
+To prevent cliff faces or tall tiles from incorrectly drawing behind ground tiles, 
+elements on the map must be rendered in isometric depth order:
+
+```typescript
+sortedElements.sort((a, b) => {
+  const depthA = a.gx + a.gy;
+  const depthB = b.gx + b.gy;
+  if (depthA !== depthB) return depthA - depthB; // Back-to-front by isometric diagonal
+  return a.gx - b.gx;                            // Left-to-right secondary tie-break
+});
+```
+
+
+----------------------------------------------------------------------------------------
+6.2 PRECISE PIXEL PICKING & OVERLAP RESOLUTION
+----------------------------------------------------------------------------------------
+In an isometric view, rectangular bounding boxes of adjacent tiles overlap significantly. 
+If a click detector checks only rectangular `rx >= 0 && rx < width`, clicks on transparent 
+corners will steal focus from adjacent tiles.
+
+Solution (Exact Diamond Hit-Testing):
+1. Iterate over placed elements in reverse order (front-to-back: top-most visual layer first).
+2. For each element, convert the canvas coordinate to relative local coordinates `(rx, ry)`.
+3. Check `findPixelInElement()`:
+   - For Base Tiles: Verify that `isInsideWestwoodDiamond(lx, ly, cx, cy)` is true.
+   - For Extra Images: Verify that `(lx, ly)` is within `(cx_extra, cy_extra)` and pixel is non-zero (or active).
+4. If a valid pixel is found, that element is the true target under the cursor.
+
+
+========================================================================================
+7. CANVAS DRAWING & CROSS-TILE TOOLS
+========================================================================================
+
+----------------------------------------------------------------------------------------
+7.1 CONTINUOUS MULTI-TILE BRUSH & CLONE PAINTING
+----------------------------------------------------------------------------------------
+When drawing across multiple tiles simultaneously (e.g. drawing continuous terrain features 
+or using the Clone Stamp tool):
+1. Loop over each pixel `(targetCavX, targetCavY)` in the brush footprint.
+2. For each pixel, dynamically call `findElementAtCoords(targetCavX, targetCavY)`.
+3. Resolve the specific tile and pixel buffer at that exact spot.
+4. Apply the paint stroke (or sample color from clone source) directly into the target tile.
+5. Invalidate the tile's render cache so updates show immediately.
+
+This allows brush strokes, lines, and clone stamps to flow seamlessly across tile seams 
+without clipping against tile boundaries.
+
+
+----------------------------------------------------------------------------------------
+7.2 DIAMOND SELECTION OUTLINES & VISUAL BOUNDS
+----------------------------------------------------------------------------------------
+When a TMP element is selected in the editor:
+- Rather than drawing a generic rectangular box (which misleads user about tile borders), 
+  draw a diamond polygon matching the 4 vertices of each tile:
+  Top:    (tx + cx/2, ty)
+  Right:  (tx + cx,   ty + cy/2)
+  Bottom: (tx + cx/2, ty + cy)
+  Left:   (tx,        ty + cy/2)
+- For tiles with extra cliff images, draw a dashed rectangular outline around the extra region.
+
+
+========================================================================================
+8. ENCODING & EXPORTING VALID TMP FILES
+========================================================================================
+When saving or exporting modified TMP files:
+1. Re-pack decoded diamond bitmaps back into the 576-byte scanline format using the reverse 
+   of the diamond expansion loop.
+2. Write the 16-byte global header (`cblocks_x`, `cblocks_y`, `cx`, `cy`).
+3. Compute the offset table:
+   - Header is 16 bytes.
+   - Offset table size = `numTiles * 4` bytes.
+   - First tile header starts at `16 + numTiles * 4`.
+4. Sequentially append each Tile Header followed by its raw diamond byte stream and 
+   optional Extra Image byte stream.
+5. Update `extra_ofs`, `z_ofs`, etc. in the tile header to point to the exact byte offsets.
+
+========================================================================================
+END OF TMP SPECIFICATION HANDBOOK
+========================================================================================

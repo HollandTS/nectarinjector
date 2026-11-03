@@ -1,0 +1,282 @@
+========================================================================
+             TILE CANVAS PRO — ARCHITECTURAL & FEATURE SPECIFICATION
+========================================================================
+
+This document provides a highly detailed architectural guide of all core 
+and advanced visual systems implemented in Tile Canvas Pro. If you are 
+rebuilding, restructuring, or implementing this pipeline from scratch, 
+the details below explain how each mathematical and image-processing system 
+behaves at runtime.
+
+------------------------------------------------------------------------
+1. DATA STRUCTURES & GRID ARCHITECTURE
+------------------------------------------------------------------------
+Tile Canvas Pro is an isometric/tiled-map canvas design and painting utility. 
+The application manages two primary types of assets on a single, layered canvas:
+
+  * Tiles (CanvasImage): Represent the individual visual segments mapped 
+    to a logical grid (gridX, gridY).
+  * Layer Overlays (ProjectOverlay): Textures, materials, or smart fields 
+    positioned over the logical coordinate space that can dynamically tile, 
+    inject, blend, deform, or warp based on underlying color features.
+
+A. The Logical Isometric Grid
+All coordinates on the canvas are evaluated inside an isometric projection.
+* Grid Configurations: Supported grids include:
+  - 'none': Static pixel layout of tiles.
+  - 'ts_full' (Tiberian Sun Grid style): 48px width x 24px height.
+  - 'ts_small': 24px width x 12px height.
+  - 'ra2_full' (Red Alert 2 style): 64px width x 32px height.
+* Projection Math (geoUtils):
+  - 3D Coordinates (X, Y) map to 2D screen space (S_x, S_y):
+    S_x = (X - Y) * (GridWidth / 2)
+    S_y = (X + Y) * (GridHeight / 2)
+  - Reverse projection (Screen-to-Iso) finds target tile indexes for clicking, 
+    painting, lassoing, and eyedropping:
+    X_iso = (S_x / (GridWidth / 2) + S_y / (GridHeight / 2)) / 2
+    Y_iso = (S_y / (GridHeight / 2) - S_x / (GridWidth / 2)) / 2
+
+B. Transparent Key Colors & Permeability
+Tiles are treated as transparent layers. Users specify a "Transparency Color Key" 
+(e.g., standard pure magenta RGB[255, 0, 255] or pure blue RGB[0, 0, 255]) 
+with a "Tolerance distance" (using Euclidean distance in RGB color space).
+Any pixel inside a tile falling within this range is treated as fully transparent 
+(alpha = 0) and is preserved from being colored or injected during overlay baking 
+and rendering.
+
+------------------------------------------------------------------------
+2. AUTO TEXTURE TILING & LAYER SETTINGS
+------------------------------------------------------------------------
+Layer Overlays can render in 'smart' mode (stretched/scaled across arbitrary 
+bounds) or 'tiled' mode (automatically duplicating across an isometric 
+lattice). Auto-tiling translates standard orthogonal texture patterns into 
+seamless isometric repetitions.
+
+A. Isometrizing Regular Textures
+Instead of drawing a rectangular grid of texture sheets, tiled textures are drawn 
+row-by-row on a rotated isometric shear.
+* Coordinate Offsets:
+  For each row [0 to repeatY] and column [0 to repeatX]:
+  - If f.tileType is 'flat':
+    tx = relX + (col - row) * (tileW / 2)
+    ty = relY + (col + row) * (tileH / 2)
+  - If f.tileType is 'slope_se' (Southeast slope elevation shift):
+    tx = relX + (col - row) * (tileW / 2)
+    ty = relY + (col + row / 2) * (tileH)
+  - If f.tileType is 'slope_sw' (Southwest slope elevation shift):
+    tx = relX + (col - row) * (tileW / 2)
+    ty = relY + (col / 2 + row) * (tileH)
+  Where:
+  - tileW & tileH represent the scaled footprint spacing values.
+  - relX & relY are relative margins on the logical canvas.
+
+B. The Scale Parameters Hierarchy
+Three nested scaling ratios control how a texturing layer fits its boundaries:
+1. Static Scale (staticScale, 0% - 100%): Scales the overall grid size or 
+   "footprint" of each tile repetition. Higher values make the grid spacing larger.
+2. Main Scale (mainScale, 0% - 200%): Sets the individual zoom factor inside 
+   each individual tile repetition, scaling the texture content itself without 
+   altering the tile boundary coordinates.
+3. Canvas Zoom (canvasZoom, 0% - 100%): Governs the crop bounds. Adjusting this 
+   effectively performs a zoom-pinch on the internal crop of the source image, 
+   clipping outer edges if values go above 100% or padding if values go below.
+
+C. Random Zoom & Position Scrambling
+* Zoom Randomness (zoomRandomness): For each tiled cell, a deterministic seed 
+  (based on column, row, and scramblePositions) evaluates a random zoom multiplier 
+  between `1 - spread/2` and `1 + spread/2`. This breaks up tile repeating patterns 
+  across large terrains.
+* Scramble Positions (scramblePositions): Feeds an integer seed offset into 
+  the noise generation, completely re-rolling rotation/scale values for cells 
+  without changing the texture source file.
+
+D. Shuffle Modes
+To combat visual repetition, the canvas can randomly mirror or rotate cells:
+* 'none': Regular uniform mapping.
+* 'mirror_h': Alternating columns are flipped horizontally on the X-axis (`scale(-1, 1)`).
+* 'mirror_v': Alternating rows are flipped vertically on the Y-axis (`scale(1, -1)`).
+* 'mirror_both': Alternating rows and columns flip in both directions.
+* 'default' (Stochastic Shuffle): Evaluates a random index based on a cell 
+  coordinate hash, rotating each tile by 0, 90, 180, or 270 degrees randomly, 
+  and randomly flipping orientations.
+
+E. Additional Textures (Weighted Shuffling)
+Instead of tiling a single image file, users can attach an array of "Additional 
+Matching Textures", each with an individual:
+  - Weight (likelihood of occurrence, e.g., 0 to 100).
+  - Canvas Zoom (to align crops).
+  - Individual Filters (hue, saturation, brightness settings).
+At bake/render time, a stochastic roulette selects either the base layer texture 
+or one of the additional textures based on their cumulative weights, applying the 
+respective individual settings to that specific cell.
+
+------------------------------------------------------------------------
+3. TEXTURE INJECTION
+------------------------------------------------------------------------
+"Texture Injection" is the core composition engine. Rather than drawing a flat, 
+semi-transparent overlay on top of tiles, it replaces pixels of specific colors 
+inside existing tiles while preserving their shading, shape, and shadows.
+
+A. The Masking & Extraction System
+Users define "Mask Groups". Each Mask Group represents a collection of "target 
+colors" with associated tolerance levels. 
+* Sampling: Colors can be added to a group via:
+  - Singular Eyedropper selections.
+  - Multi-pixel Lasso selections.
+* Local Extraction:
+  At runtime, the processor scans every pixel of a tile's visual state:
+  1. If a pixel's RGB color matches the Transparency Key, it is bypassed.
+  2. If the pixel's RGB color matches any color in a Mask Group (within the 
+     group's tolerance), a "match" is registered.
+  3. The matched pixel's destination color gets blended/replaced by the corresponding 
+     pixel from the Overlay's tiled texture at that spatial location.
+
+B. Alignment & Projection
+Overlays are placed in logical canvas space, meaning the tiled pattern aligns 
+seamlessly across multiple different adjacent tiles. The processor evaluates 
+the physical tile draw coordinates relative to the canvas origin. Thus, if physical 
+tile drawing starts at (imageDrawX, imageDrawY), the overlay texture lookup translates 
+by this offset. The final result is a beautiful, continuous, seamless field spanning 
+the map, bound perfectly within specified color boundaries.
+
+C. Color & Filter Baking
+To lock in look-and-feel adjustments (blur, sharpen, brightness, contrast, 
+saturation, and hue):
+1. Users click "Apply" under "Color & Filters".
+2. The browser renders the texture source onto an offscreen canvas.
+3. It applies a compound hardware CSS filter: 
+   `blur() brightness() contrast() saturate() hue-rotate()`.
+4. It extracts the raw pixels, applies high-performance 3x3 convolution matrices 
+   for sharpening, and replaces the underlying file source with an optimized, 
+   high-contrast Base64 DataURL representation.
+5. All overlay filters are then reset to defaults (e.g., brightness = 100%, crop = 100%), 
+   ensuring the visual state remains completely identical but highly performant.
+6. The baking process copies and applies these properties for both the primary 
+   base layer texture and all attached "Additional Textures" while strictly preserving 
+   and cleaning original alpha boundaries (fully transparent pixels).
+7. "Undo" stores a snapshot of pre-baked inputs so users can instantly restore 
+   original assets.
+
+------------------------------------------------------------------------
+4. DEPTH INJECTION
+------------------------------------------------------------------------
+To give flat textures realistic 3D shading, "Depth Injection" blends 
+shadows, highlights, and micro-geometry from a source "heightmap" or 
+"depth overlay" directly into the injected texture stream.
+
+A. Heightmap Evaluation & Sourcing
+Depth settings are bound to a "depthOverlayId". Users can choose:
+  - 'base': Uses the original tile's physical shading values as a heightmap.
+  - An Overlay Layer: Uses another overlay layer's raw pixels (typically 
+    a grayscale bump/heightmap) to drive the deformation.
+
+B. Shading & HSL Modulation Math
+During pixel-level evaluation, the heightmap's luminance (dl, 0% to 100%) is analyzed:
+1. Invert: If enabled, dl = 100 - dl.
+2. Levels: Modifies depth values through Black Level (black) and White Level (white):
+   MappedDepth = ((dl - black) / (white - black)) * 100
+3. Posterization (f.depthSettings.posterize): Reduces continuous depth gradients 
+   into discrete steps, creating stepped terraces or stylized retro slopes:
+   LevelsCount = 20 * (1 - posterize / 100)
+   dl = round(dl / (100 / (LevelsCount - 1))) * (100 / (LevelsCount - 1))
+4. Local Contrast Retention: Rather than washing out texture details in shadows/highlights, 
+   the overlay's original detail is extracted as a delta against midtones (`overlayDetail = l - 50`) 
+   and added back on top of the depth lightness:
+   l = MappedDepth + (overlayDetail * ContrastScalar)
+5. Under represented / Midtone Correction: Shading influences can be modified 
+   selectively based on underlying colors to avoid washing out textures:
+   - Green Correction (greenAdjustment): Targets greens (Hue 70 to 170).
+   - Brown Correction (brownAdjustment): Targets browns/oranges (Hue 10 to 50).
+   - Gray Correction (greyAdjustment): Targets desaturated ranges (Saturation < 20).
+
+C. Advanced Normalizations
+* Slope Compensation: Dampens extreme highlights/shadows to ensure textures 
+  do not overexpose under extreme lighting slopes.
+* Luminance Influence (luminanceInfluence): Transfers natural brightness levels 
+  from the original tile directly into the final texture. This is balanced 
+  with automatic saturation boosts to prevent coloring washout.
+* Edge Enhancement (edgeEnhancement): Applies high-performance sharpening passes 
+  exclusively on the depth-shading buffer to create sharp, crisp surface ridges.
+* Depth Tolerance (depthTolerance): Acts as a low-end mask cutoff. If depth values 
+  fall below this threshold, the system smoothly interpolates and fades back to 
+  the original base tile textures to prevent black artifacts in deep shadows.
+
+------------------------------------------------------------------------
+5. CONTOUR INJECTIONS & TRANSITIONS
+------------------------------------------------------------------------
+Transitions let designers draw clean, beautiful transitions or blended borders 
+between two distinctly colored terrain types (e.g., grass and dirt, sand and water) 
+using custom "Transition Stamps" or "Contour masks".
+
+A. Mask A / Mask B Classification
+Users select a Transition Overlay containing a continuous gradient or stamp pattern:
+1. Group A represents the source terrain/mask colors (e.g., Grass colors).
+2. Group B represents the destination terrain/mask colors (e.g., Sand colors).
+The algorithm creates two separate boolean bitmask arrays (maskA and maskB) 
+where each matched pixel index is marked with a 1 or 0.
+
+B. Distance Field Calculation & Feathering
+For every pixel marked inside either Mask A or Mask B:
+1. It registers the shortest Euclidean pixel distance (minDist) to the boundary 
+   of the opposing mask (e.g., if a pixel is inside Mask A, what is the distance 
+   to the closest pixel inside Mask B).
+2. Thickness: Governs the maximum distance (in pixels) over which the transition 
+   occurs. If a pixel's distance is less than or equal to this thickness, it qualifies 
+   for blending.
+3. Alpha Interpolation: Coordinates transition alpha:
+   Alpha = 1 - (minDist / Thickness)
+4. Feathering (contourFeather): Controls the blending ease-in. Applies a power 
+   transform to the alpha variable:
+   Alpha = Alpha ^ (1 + Feather / 10)
+
+C. Noise Deformation (contourNoise)
+To prevent borders from looking perfectly straight, "Contour Noise" adds physical 
+turbulence. A wave equation deforms the distance value based on sinusoidal coordinates:
+Turbulence = (sin(x * 0.2) + sin(y * 0.2) + rand() * 0.5) * NoiseAmount
+minDist = minDist + Turbulence
+This creates natural-looking, organic, jagged shorelines, grass edges, or rock cracks.
+
+D. Stamp / Transition Sources (transitionOverlayId)
+If a transition source texture exists, the transition blends the destination pixels 
+using the color output of that overlay layer (applying the Alpha calculated from the 
+boundary distance field). If no transition source is chosen, it defaults to a clean, 
+light-scattering darkness blend.
+
+------------------------------------------------------------------------
+6. OTHER CANVAS CORE UTILITIES
+------------------------------------------------------------------------
+Tile Canvas Pro provides secondary tools to facilitate design workflows:
+
+A. The Stamp Drawing Tool ('TRANSITION_STAMP')
+Let's users place large, rotated, and skewed textures directly onto tiles:
+* Falloff Width (falloffWidth): Applies a radial transparency falloff to 
+  stamp bounds, fading edges seamlessly.
+* Auto-Snap (autoSnap): Snaps stamp coordinate origins to the closest grid 
+  intersection.
+* Skew (skewX, skewY): Introduces shear transformations directly into 
+  the drawing matrix before stamps are rendered.
+
+B. Shore Drawing & Fills ('SHORE_DRAW')
+A standalone raster-drawing overlay designed specifically to draw shoreline borders.
+* Draw Mode: Maps custom geometric coordinates (lines) with adjustable:
+  - Thickness (lineWidth).
+  - Soft Feathering (feathering).
+  - Wave Jitter & Cloud Scatter (randomized displacement factors for creating frothy water).
+* Fill Mode: Employs high-speed queue-based Flood-Fill on an offscreen canvas 
+  to flood-fill color boundaries while respecting the layout margins.
+
+C. 4-in-1 Slicing Utility
+Slices a single tile asset into 4 clean quarter-tile isometric segments, automatically 
+saving and appending them into the Additional Textures library for rapid asset variation.
+
+D. Smart & Simple Color Swaping
+* Simple Color Swap: Scans every single pixel in the overlay. If a pixel falls 
+  within a tolerance of a target color, it swaps it cleanly for a replacement.
+* Smart Color Swap: Applies specialized HSV and HSL scaling to the matched range, 
+  allowing users to alter color profiles without losing any under-represented shadows, 
+  highlights, or lighting details.
+
+E. 3D Model Panel
+Standard GLB model viewer and loader. Maps logical 2D coordinate placements 
+into physical 3D spaces with standard and "Smart" UV texturing.
+========================================================================

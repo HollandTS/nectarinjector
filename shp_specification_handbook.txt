@@ -1,0 +1,718 @@
+========================================================================================
+COMMAND & CONQUER (TIBERIAN SUN / RED ALERT 2) SHP (FORMAT 80) SPECIFICATION & IMPLEMENTATION HANDBOOK
+========================================================================================
+
+Designed as a complete, comprehensive, and self-contained engineering blueprint. 
+This specification covers binary layout, decoding/encoding algorithms, scale/resize mathematics, 
+offset stabilization (drifting prevention), and visualization techniques for TS/RA2 SHP Format 80 files.
+
+----------------------------------------------------------------------------------------
+TABLE OF CONTENTS
+----------------------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & SHP ARCHITECTURE
+2. BINARY SCHEMA & SPECIFICATION (FORMAT 80)
+3. FORMAT 80 DECODING (RLE ZERO COMPRESSION)
+4. FORMAT 80 ENCODING (RLE ZERO COMPRESSION)
+5. SAVING & SERIALIZING COMPLETE SHP FILES (writeShp)
+6. FRAME BOUNDING BOX OPTIMIZATION (CROPPING & OFFSET ADJUSTMENT)
+7. CANVAS DIMENSIONS VS. FRAME OFFSETS (STABILIZING THE FRAME CENTER)
+8. THE MATHEMATICS OF SHP SCALING & RESIZING
+   8.1 Nearest Neighbor (Pixel Perfect)
+   8.2 Bilinear (Filtered & Re-indexed)
+   8.3 Lanczos3 (High-Fidelity Spline Interpolation)
+9. PALETTE MAPPING & TRANS-GUARD HOVER FLUIDITY
+10. GIF ANIMATION CONVERSION & FRAME DISPOSAL DISCOVERY
+11. INTEGRATION INSTRUCTIONS & COMMON SAVING PITFALLS FOR ANOTHER APP
+
+
+========================================================================================
+1. EXECUTIVE SUMMARY & SHP ARCHITECTURE
+========================================================================================
+Command & Conquer: Tiberian Sun and Red Alert 2 utilize a proprietary image sequence file 
+format called .SHP (specifically, "Format 80"). Unlike standard sprite sheets or modern 
+PNG sequences where each frame is typically of identical dimensions, .SHP stores 
+animations in a highly optimized layout containing:
+- A Global Width and Global Height (describing the virtual maximum canvas boundaries).
+- Individual Frame Offsets (x, y) defining where a frame sits relative to the top-left 
+  of the global canvas.
+- Individual Frame Dimensions (w, h) containing only the non-transparent/compacted portion 
+  of that specific frame.
+- Color indexing: A 256-color paletted format (typically using 1 byte per pixel). 
+  Index 0 is strictly reserved as absolute transparency.
+
+This layout minimizes disk size and VRAM footprints because only active pixels are encoded and 
+stored, stripping out surrounding blank space. However, it introduces severe spatial alignment 
+vulnerabilities: any slight error in coordinate offsets calculation during processing, scaling, 
+cropping, or generation results in rapid "wobbling" or "drifting" animations.
+
+
+========================================================================================
+2. BINARY SCHEMA & SPECIFICATION (FORMAT 80)
+========================================================================================
+Format 80 SHP files are encoded in Little-Endian byte order.
+
+----------------------------------------------------------------------------------------
+A. GLOBAL HEADER (First 8 Bytes)
+----------------------------------------------------------------------------------------
+Offset (Bytes) | Data Type | Description
+----------------------------------------------------------------------------------------
+0..1           | uint16    | Header Type (Historically 0; some tools issue warnings if not 0)
+2..3           | uint16    | Global Width (Max bound of the asset canvas)
+4..5           | uint16    | Global Height (Max bound of the asset canvas)
+6..7           | uint16    | Number of frames (Images included in the archive)
+
+----------------------------------------------------------------------------------------
+B. FRAME HEADERS BLOCK (Starts at Offset 8; Size = Number of frames * 24 Bytes)
+----------------------------------------------------------------------------------------
+Each frame has a dedicated 24-byte header.
+
+Offset (Relative) | Data Type | Description
+----------------------------------------------------------------------------------------
+0..1              | uint16    | Frame Offset X (x-coordinate origin on global canvas)
+2..3              | uint16    | Frame Offset Y (y-coordinate origin on global canvas)
+4..5              | uint16    | Frame Width (w; dimensions of this individual sprite slice)
+6..7              | uint16    | Frame Height (h; dimensions of this individual sprite slice)
+8..11             | uint32    | Compression & Flags type.
+                  |           | - The lower 2 bits (flags & 0x03) determine compression:
+                  |           |   0 = No Compression (Uncompressed 8-bit index array)
+                  |           |   2 = RLE (Format 40 - rarely used in TS/RA2)
+                  |           |   3 = RLE Zero (Format 80 - standard; runs of zeros skipped)
+12..15            | uint32    | Unknown/Reserved (Usually 0)
+16..19            | uint32    | Unknown/Reserved/Radar Color (Used for radar color in some tools)
+20..23            | uint32    | Absolute File Offset (Byte index where RLE or raw data begins)
+
+
+========================================================================================
+3. FORMAT 80 DECODING (RLE ZERO COMPRESSION)
+========================================================================================
+When flags specify RLE Zero (compression mode = 3), the frame data at `Absolute File Offset` 
+is encoded as a series of rows. The number of rows is exactly equal to the frame's 
+individual Height (h).
+
+----------------------------------------------------------------------------------------
+LINE-BY-LINE DECODING PROTOCOL:
+----------------------------------------------------------------------------------------
+For each row from y = 0 to y < Frame Height:
+1. At the current read offset, read a 16-bit unsigned integer representing the Line Length 
+   (lineLen). This length includes the two count bytes themselves.
+2. If lineLen is less than 2, the row contains no valid data or is empty. Skip to the next row.
+3. Establish a write offset index (x = 0) representing the current pixel column in the output row.
+4. Set up a line-local read pointer starting at byte offset 2 (skipping the lineLen bytes):
+   - Read the next byte (val).
+   - IF `val === 0`:
+       - This is a skip instruction!
+       - Read the immediate next byte (count).
+       - Advance the column cursor: `x = x + count`. (These skipped pixels remain 0/transparent).
+       - Advance the line-local read pointer by 2 bytes.
+   - ELSE:
+       - This is a direct color index pixel!
+       - Write `val` to the output buffer at `(y * Frame Width) + x`.
+       - Advance the column cursor: `x = x + 1`.
+       - Advance the line-local read pointer by 1 byte.
+5. Once `x >= Frame Width` or the line-local read pointer matches `lineLen`, the line is complete.
+6. Advance the global data pointer forward by exactly `lineLen` bytes and repeat for the next row.
+
+----------------------------------------------------------------------------------------
+TS/JS IMPLEMENTATION LOGIC:
+----------------------------------------------------------------------------------------
+```typescript
+function decodeRLEZero(fileData: Uint8Array, dataOffset: number, w: number, h: number): Uint8Array {
+    const out = new Uint8Array(w * h);
+    out.fill(0); // Initialize everything to index 0 (transparency)
+
+    let currentReadOffset = 0;
+    const totalLen = fileData.length;
+
+    for (let y = 0; y < h; y++) {
+        const lineStart = dataOffset + currentReadOffset;
+        if (lineStart + 2 > totalLen) break;
+
+        // Line length is saved as 16-bit integer
+        const lineLen = fileData[lineStart] | (fileData[lineStart + 1] << 8);
+        if (lineLen < 2 || lineStart + lineLen > totalLen) break;
+
+        let curByte = 2; // skip first two bytes which represent lineLength
+        let x = 0;
+        const lineOffset = y * w;
+
+        while (curByte < lineLen && x < w) {
+            const val = fileData[lineStart + curByte];
+            if (val === 0) {
+                if (curByte + 1 >= lineLen) break;
+                let count = fileData[lineStart + curByte + 1];
+                curByte += 2;
+                x += count; // Skip 'count' empty transparent pixels (staying value 0)
+            } else {
+                out[lineOffset + x] = val; // Direct color mapping
+                x++;
+                curByte++;
+            }
+        }
+        currentReadOffset += lineLen;
+    }
+    return out;
+}
+```
+
+
+========================================================================================
+4. FORMAT 80 ENCODING (RLE ZERO COMPRESSION)
+========================================================================================
+Encoding takes a raw 1D array of 8-bit palette indices (size = w * h) and generates compressed 
+Format 80 line slices for each row of the frame.
+
+----------------------------------------------------------------------------------------
+LINE-BY-LINE ENCODING PROTOCOL:
+----------------------------------------------------------------------------------------
+For each row from y = 0 to y < Frame Height:
+1. Initialize an empty dynamic byte container, `lineBytes = []`.
+2. Set `x = 0`.
+3. WHILE running through the row columns (`x < Frame Width`):
+   - Keep track of index value at current position: `val = indices[y * Frame Width + x]`.
+   - IF `val === 0`:
+       - This starts a transparent run. Count how many continuous zeros lie ahead.
+       - Count zeros up to a maximum of 255 (the maximum number a single byte can carry) or 
+         until the end of the line: `while (x < w and indices[x] == 0 and count < 255)`.
+       - Push `0` (the skip indicator) and `count` into the `lineBytes` buffer.
+       - Advance `x` by `count`.
+   - ELSE:
+       - Push the literal uncompressed byte index `val` into `lineBytes`.
+       - Advance `x` by 1.
+4. Prepend the line length header:
+   - Calculate total byte length including length prefix: `lineLen = lineBytes.length + 2`.
+   - Create a buffer representing this line with structure:
+     `[lineLen & 0xFF, (lineLen >> 8) & 0xFF, ...lineBytes]`
+5. Append this line buffer to the collective compressed frame output stream.
+
+----------------------------------------------------------------------------------------
+COMPLETE TS/JS IMPLEMENTATION OF encodeRLEZero:
+----------------------------------------------------------------------------------------
+```typescript
+export function encodeRLEZero(indices: Uint8Array, w: number, h: number): Uint8Array {
+    const lines: Uint8Array[] = [];
+    let totalPayloadSize = 0;
+
+    for (let y = 0; y < h; y++) {
+        const lineBytes: number[] = [];
+        let x = 0;
+        const lineOffset = y * w;
+
+        while (x < w) {
+            const val = indices[lineOffset + x];
+            if (val === 0) {
+                let count = 0;
+                while (x < w && indices[lineOffset + x] === 0 && count < 255) {
+                    count++;
+                    x++;
+                }
+                lineBytes.push(0);
+                lineBytes.push(count);
+            } else {
+                lineBytes.push(val);
+                x++;
+            }
+        }
+
+        const lineLen = lineBytes.length + 2;
+        const lineBuffer = new Uint8Array(lineLen);
+        lineBuffer[0] = lineLen & 0xFF;
+        lineBuffer[1] = (lineLen >> 8) & 0xFF;
+        for (let i = 0; i < lineBytes.length; i++) {
+            lineBuffer[2 + i] = lineBytes[i];
+        }
+
+        lines.push(lineBuffer);
+        totalPayloadSize += lineLen;
+    }
+
+    const output = new Uint8Array(totalPayloadSize);
+    let ptr = 0;
+    for (const ln of lines) {
+        output.set(ln, ptr);
+        ptr += ln.length;
+    }
+    return output;
+}
+```
+
+
+========================================================================================
+5. SAVING & SERIALIZING COMPLETE SHP FILES (writeShp)
+========================================================================================
+To properly save an SHP file, you must serialize:
+1. An 8-byte Global Header.
+2. A table of 24-byte Frame Headers (one header per frame).
+3. The contiguous compressed frame payloads concatenated directly following the headers.
+
+All multi-byte numeric fields MUST be written in Little-Endian byte order!
+
+----------------------------------------------------------------------------------------
+BUFFER SIZE CALCULATION & LAYOUT:
+----------------------------------------------------------------------------------------
+```
+Offset 0:                               +-------------------------------+
+                                        | Global Header (8 Bytes)       |
+Offset 8:                               +-------------------------------+
+                                        | Frame Header 0 (24 Bytes)     |
+                                        +-------------------------------+
+                                        | Frame Header 1 (24 Bytes)     |
+                                        +-------------------------------+
+                                        | ...                           |
+                                        +-------------------------------+
+                                        | Frame Header N-1 (24 Bytes)   |
+Offset 8 + (N * 24):                    +-------------------------------+
+                                        | Compressed Frame 0 Payload    |
+                                        +-------------------------------+
+                                        | Compressed Frame 1 Payload    |
+                                        +-------------------------------+
+                                        | ...                           |
+                                        +-------------------------------+
+                                        | Compressed Frame N-1 Payload  |
+End of File:                            +-------------------------------+
+```
+
+- Base Header Size = 8 bytes.
+- Frame Headers Block Size = `numFrames * 24` bytes.
+- Data Payload Size = Sum of the byte lengths of all encoded frame streams.
+- Total File Buffer Size = `8 + (numFrames * 24) + dataPayloadSize`.
+
+----------------------------------------------------------------------------------------
+STEP-BY-STEP BYTE FIELD MAPPING:
+----------------------------------------------------------------------------------------
+A. Global Header (8 Bytes):
+   - Offset 0..1: uint16 = 0 (Header Type / magic signature)
+   - Offset 2..3: uint16 = `shp.width` (Global canvas width)
+   - Offset 4..5: uint16 = `shp.height` (Global canvas height)
+   - Offset 6..7: uint16 = `shp.frames.length` (Total frame count)
+
+B. Frame Header i (24 Bytes each, at byte offset: `8 + (i * 24)`):
+   - Offset 0..1: uint16 = `frame.x` (Origin X on global canvas)
+   - Offset 2..3: uint16 = `frame.y` (Origin Y on global canvas)
+   - Offset 4..5: uint16 = `frame.w` (Frame sprite width)
+   - Offset 6..7: uint16 = `frame.h` (Frame sprite height)
+   - Offset 8..11: uint32 = 3 (Flags: bits 0..1 = 3 for Format 80 RLE Zero)
+   - Offset 12..15: uint32 = 0 (Reserved)
+   - Offset 16..19: uint32 = 0 (Reserved / Radar color)
+   - Offset 20..23: uint32 = `currentDataOffset` (Absolute byte index of this frame's compressed payload)
+
+C. Writing Payloads:
+   - Initial `currentDataOffset = 8 + (numFrames * 24)`.
+   - For each frame `i`:
+     1. Store `currentDataOffset` into Frame Header `i` at relative offset 20.
+     2. Copy encoded bytes of frame `i` into the buffer at `currentDataOffset`.
+     3. Increment `currentDataOffset += encoded.length`.
+
+----------------------------------------------------------------------------------------
+COMPLETE TS/JS IMPLEMENTATION OF writeShp:
+----------------------------------------------------------------------------------------
+```typescript
+export interface ShpFrame {
+    x: number;          // X offset on global canvas
+    y: number;          // Y offset on global canvas
+    w: number;          // Frame width
+    h: number;          // Frame height
+    flags?: number;     // Compression flags (defaults to 3)
+    fileOffset?: number;// Computed during serialization
+    data: Uint8Array;   // w * h uncompressed 8-bit palette indices
+    isShadow?: boolean; // Optional shadow indicator
+}
+
+export interface ShpFile {
+    width: number;      // Global canvas width
+    height: number;     // Global canvas height
+    frames: ShpFrame[];
+    type?: 'SHP';
+    sourceType?: 'TS' | 'RA2' | 'OpenTS' | 'OpenTS_48x96';
+}
+
+export function writeShp(shp: ShpFile): ArrayBuffer {
+    const numFrames = shp.frames.length;
+    const frameHeadersSize = numFrames * 24;
+    const baseHeaderSize = 8;
+    let dataPayloadSize = 0;
+
+    // Step 1: Pre-encode all frames to determine total payload size
+    const encodedFrames: Uint8Array[] = [];
+    shp.frames.forEach(frame => {
+        const encoded = encodeRLEZero(frame.data, frame.w, frame.h);
+        encodedFrames.push(encoded);
+        dataPayloadSize += encoded.length;
+    });
+
+    // Step 2: Allocate contiguous ArrayBuffer
+    const totalSize = baseHeaderSize + frameHeadersSize + dataPayloadSize;
+    const buffer = new ArrayBuffer(totalSize);
+    const dv = new DataView(buffer);
+    const u8 = new Uint8Array(buffer);
+
+    // Step 3: Write Global Header (all uint16 Little-Endian)
+    dv.setUint16(0, 0, true);              // Header type
+    dv.setUint16(2, shp.width, true);      // Global canvas width
+    dv.setUint16(4, shp.height, true);     // Global canvas height
+    dv.setUint16(6, numFrames, true);      // Number of frames
+
+    let currentDataOffset = baseHeaderSize + frameHeadersSize;
+
+    // Step 4: Write Frame Headers and copy payloads
+    for (let i = 0; i < numFrames; i++) {
+        const frame = shp.frames[i];
+        const hOffset = baseHeaderSize + i * 24;
+        const encoded = encodedFrames[i];
+
+        // Frame header fields
+        dv.setUint16(hOffset, frame.x, true);
+        dv.setUint16(hOffset + 2, frame.y, true);
+        dv.setUint16(hOffset + 4, frame.w, true);
+        dv.setUint16(hOffset + 6, frame.h, true);
+        dv.setUint32(hOffset + 8, 3, true); // Format 80 RLE Zero
+        dv.setUint32(hOffset + 12, 0, true);
+        dv.setUint32(hOffset + 16, 0, true);
+        dv.setUint32(hOffset + 20, currentDataOffset, true); // Absolute file offset
+
+        // Copy encoded payload into the buffer at the tracked offset
+        u8.set(encoded, currentDataOffset);
+        currentDataOffset += encoded.length;
+    }
+
+    return buffer;
+}
+```
+
+----------------------------------------------------------------------------------------
+HOW TO DOWNLOAD / EXPORT IN A BROWSER APPLICATION:
+----------------------------------------------------------------------------------------
+```typescript
+export function downloadShpFile(shp: ShpFile, filename: string = 'export.shp') {
+    const buffer = writeShp(shp);
+    const blob = new Blob([buffer], { type: 'application/octet-stream' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+}
+```
+
+
+========================================================================================
+6. FRAME BOUNDING BOX OPTIMIZATION (CROPPING & OFFSET ADJUSTMENT)
+========================================================================================
+When generating or modifying SHP frames (e.g. from full-canvas layers, scaled sprites, or PNGs), 
+storing large borders of transparent zeroes (index 0) wastes file size and slows in-game rendering. 
+Authentic Westwood SHPs crop each frame tightly around non-zero pixels and store the crop 
+offsets in `frame.x` and `frame.y`.
+
+CRITICAL RULE: Whenever you crop transparent margins from a frame, you MUST add the crop 
+origin (`minX`, `minY`) to the existing `frame.x` and `frame.y`. If you fail to do this, 
+the animation will wobble or drift out of position!
+
+----------------------------------------------------------------------------------------
+BOUNDING BOX ALGORITHM & CROP LOGIC:
+----------------------------------------------------------------------------------------
+```typescript
+export function cropFrameToBounds(
+    rawData: Uint8Array, 
+    rawW: number, 
+    rawH: number, 
+    originalOffsetX: number = 0, 
+    originalOffsetY: number = 0
+): { x: number; y: number; w: number; h: number; data: Uint8Array } {
+    let minX = rawW;
+    let minY = rawH;
+    let maxX = -1;
+    let maxY = -1;
+
+    // Scan for non-transparent pixel boundaries
+    for (let y = 0; y < rawH; y++) {
+        const rowOff = y * rawW;
+        for (let x = 0; x < rawW; x++) {
+            if (rawData[rowOff + x] !== 0) {
+                if (x < minX) minX = x;
+                if (y < minY) minY = y;
+                if (x > maxX) maxX = x;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+
+    // EDGE CASE: Completely transparent / blank frame
+    // WARNING: NEVER set w = 0 or h = 0! Game engines crash on zero dimensions.
+    // Instead, save a 1x1 frame with a single zero byte:
+    if (maxX === -1) {
+        return {
+            x: originalOffsetX,
+            y: originalOffsetY,
+            w: 1,
+            h: 1,
+            data: new Uint8Array([0])
+        };
+    }
+
+    // Calculate tight cropped dimensions and adjusted global canvas offsets
+    const croppedW = maxX - minX + 1;
+    const croppedH = maxY - minY + 1;
+    const croppedX = originalOffsetX + minX;
+    const croppedY = originalOffsetY + minY;
+
+    // Copy only the active bounding box pixels
+    const croppedData = new Uint8Array(croppedW * croppedH);
+    for (let y = 0; y < croppedH; y++) {
+        const srcOff = (minY + y) * rawW + minX;
+        const dstOff = y * croppedW;
+        for (let x = 0; x < croppedW; x++) {
+            croppedData[dstOff + x] = rawData[srcOff + x];
+        }
+    }
+
+    return {
+        x: croppedX,
+        y: croppedY,
+        w: croppedW,
+        h: croppedH,
+        data: croppedData
+    };
+}
+```
+
+
+========================================================================================
+7. CANVAS DIMENSIONS VS. FRAME OFFSETS (STABILIZING THE FRAME CENTER)
+========================================================================================
+This is the most critical conceptual barrier for developers building SHP tools.
+
+1. **The Global Canvas Stage**:
+   Every animation asset holds a global `width` and `height`. The game engine renders the sprite 
+   relative to its coordinate on this theoretical maximum dimension panel. Think of it as a bounding 
+   box container wrapping the character/structure's total movement scope.
+
+2. **The Local Frame Anchor**:
+   Each individual frame `i` is defined by:
+   - `frame.x` & `frame.y` (the pixel coordinate offset where the frame's top-left meets the bounds).
+   - `frame.width` & `frame.height` (the pixel width and height of the actual non-transparent block).
+
+3. **Frame-to-Canvas Placement Conversion Math**:
+   To draw standard frame sprites onto the global canvas surface (e.g. for creating a stable animation loop, 
+   exporting to GIF, or composite calculations):
+   ```
+   GlobalCanvasPixel[ (destY * GlobalWidth) + destX ] = FramePixel[ (srcY * FrameWidth) + srcX ]
+   where:
+   destX = srcX + frame.x
+   destY = srcY + frame.y
+   ```
+   All rendering and compositing systems MUST draw using individual offsets. **Never assume all frames are 
+   pinned to (0,0)**. A single floating frame with incorrect offsets will instantly introduce visual wobbles.
+
+
+========================================================================================
+8. THE MATHEMATICS OF SHP SCALING & RESIZING
+========================================================================================
+Scaling paletted images presents a major mathematical hazard compared to RGBA textures:
+- You **cannot** mathematically average paletted indices directly. (e.g. Interpolating Palette Index 4 and 
+  Palette Index 6 does NOT yield the biological visual midpoint Color 5 if the palette sequence is arbitrary).
+- Standard interpolation must be executed strictly in **RGBA space**, then mapped back to the closest matching 
+  index in the palette using Euclidean distance algorithms, matching index 0 as transparency guards.
+
+----------------------------------------------------------------------------------------
+8.1 Nearest Neighbor (Pixel Perfect)
+----------------------------------------------------------------------------------------
+Best for conserving authentic pixelart aesthetics. Extremely fast, involves no color conversions.
+```
+srcX = clamp(floor(destX * (SourceWidth / TargetWidth)), 0, SourceWidth - 1)
+srcY = clamp(floor(destY * (SourceHeight / TargetHeight)), 0, SourceHeight - 1)
+```
+
+----------------------------------------------------------------------------------------
+8.2 Bilinear (Filtered & Re-indexed)
+----------------------------------------------------------------------------------------
+Uses a weighted average of the four nearest pixel values in RGBA representation before mapping the calculated 
+result back to a 256-color palette.
+
+Let `(gx, gy)` be the calculated fractional float position:
+```
+gxi = floor(gx), gyi = floor(gy)
+xDiff = gx - gxi, yDiff = gy - gyi
+```
+Sample the 4 neighboring coordinates: `c00 = Sample(gxi, gyi)`, `c10 = Sample(gxi+1, gyi)`, 
+`c01 = Sample(gxi, gyi+1)`, `c11 = Sample(gxi+1, gyi+1)`.
+
+*Mathematical Lerp:*
+```
+R_final = c00.r * (1 - xDiff) * (1 - yDiff) + c10.r * xDiff * (1 - yDiff) + c01.r * (1 - xDiff) * yDiff + c11.r * xDiff * yDiff
+(Calculate similarly for G, B, and Alpha channels)
+```
+
+*Transparency Guard:*
+If `Alpha_final < 128`, write Index `0` (Strict Transparency).
+Otherwise, convert `(R_final, G_final, B_final)` back to the index with the minimum Euclidean color-space distance.
+
+----------------------------------------------------------------------------------------
+8.3 Lanczos3 (High-Fidelity Spline Interpolation)
+----------------------------------------------------------------------------------------
+Windowed Sinc function used to calculate weights over a 6x6 pixel grid neighborhood (window size `a = 3`).
+Window support weights are computed using the Lanczos kernel:
+```
+sinc(x) = sin(pi * x) / (pi * x)
+lanczos(x, a) = sinc(x) * sinc(x / a)  for |x| < a; else 0
+```
+By resolving horizontally first in an intermediate float buffer, then vertically second (separability property), 
+processing times are drastically reduced from O(W*H*a^2) down to O(W*H*a).
+
+----------------------------------------------------------------------------------------
+THE DRIFTING & ALIGNMENT EQUATION:
+----------------------------------------------------------------------------------------
+When scaling a whole SHP file, you must scale BOTH the Frame Dimensions and the Frame Anchors using the 
+same relative floating scaling factor:
+```
+scaled_width  = max(1, Math.round(original_frame_width * scale))
+scaled_height = max(1, Math.round(original_frame_height * scale))
+scaled_x      = Math.round(original_frame_offset_x * scale)
+scaled_y      = Math.round(original_frame_offset_y * scale)
+```
+Failure to scale `frame.x` and `frame.y` causes scaled animations to drift and "shake" relative to the pivot plane.
+
+*Content Bounds Calculation*:
+After resizing, the program must always scan the scaled index arrays and locate the exact bounding box 
+containing non-transparent pixels (all indices except 0) so coordinates can be cropped or checked:
+```typescript
+let minX = targetW, minY = targetH, maxX = -1, maxY = -1;
+for (let i = 0; i < newIndices.length; i++) {
+  if (newIndices[i] !== 0) {
+    const px = i % targetW;
+    const py = Math.floor(i / targetW);
+    if (px < minX) minX = px;
+    if (py < minY) minY = py;
+    if (px > maxX) maxX = px;
+    if (py > maxY) maxY = py;
+  }
+}
+const contentBounds = (maxX === -1) 
+  ? { minX: 0, minY: 0, maxX: 0, maxY: 0 } 
+  : { minX, minY, maxX, maxY };
+```
+
+
+========================================================================================
+9. PALETTE MAPPING & TRANS-GUARD HOVER FLUIDITY
+========================================================================================
+Because index values are mapped directly to a separate `.PAL` format file (C&C palettes are standard raw arrays 
+of 256 RGB combinations), a dedicated pixel-matching strategy is necessary for all interpolation tools:
+
+----------------------------------------------------------------------------------------
+THE PALETTE SEAT SCANNER:
+----------------------------------------------------------------------------------------
+To translate an interpolated RGBA color back into a valid Palette Index, use the Euclidean Color Distance formula:
+```
+Distance = sqrt( (R_target - R_candidate)^2 + (G_target - G_candidate)^2 + (B_target - B_candidate)^2 )
+```
+*Algorithm Optimization*:
+Skip testing index 0 during color searches because Index 0 is reserved strictly for transparent mask execution! 
+Iterate candidates only from Index 1 through Index 255.
+
+```typescript
+export function findNearestColor(r: number, g: number, b: number, palette: {r: number, g: number, b: number}[]): number {
+  let minDistance = Infinity;
+  let bestIndex = 1; // start at 1 to preserve index 0 as transparency mask
+  
+  for (let i = 1; i < 256; i++) {
+    const color = palette[i];
+    if (!color) continue;
+    const d = (r - color.r) ** 2 + (g - color.g) ** 2 + (b - color.b) ** 2;
+    if (d < minDistance) {
+      if (d === 0) return i; // Exact match found, return early
+      minDistance = d;
+      bestIndex = i;
+    }
+  }
+  return bestIndex;
+}
+```
+
+
+========================================================================================
+10. GIF ANIMATION CONVERSION & FRAME DISPOSAL DISCOVERY
+========================================================================================
+When exporting paletted SHP sequences into a standard animated GIF web document:
+
+1. **Map to Global Frame Offset Spaces**:
+   Because GIF frames might be trimmed or structured around a global visual canvas, you must create 
+   a full static pixel buffer of dimensions `global_width * global_height` for each step. 
+   - Pre-fill this canvas buffer containing index 0 (acting as the default transparent background).
+   - Overlay the target frame index array utilizing the offset anchors `(x, y)`.
+
+2. **The "Ghosting" Artifact Trap (GIF Disposal Method 2)**:
+   In GIF specs, Disposal represents how the viewer handles a frame after the delay is complete.
+   - If Disposal = 0 or 1, the renderer leaves the frame on the screen, stacking subsequent frames on top. 
+     Since SHP frames vary in sizes and offsets, this causes older frames to stay static and "leak" or 
+     "ghost" around the moving edges of smaller current frames.
+   - **THE SOLUTION**: Disposal **MUST** be explicitly set to `2` ("Restore to Background Color"). This forces 
+     the canvas renderer to clear the previous drawing area before printing the next frame index, 
+     preventing visual artifacts completely.
+
+```typescript
+// Disposal setting 2 is critical
+writer.addFrame(0, 0, shp.width, shp.height, frameIndexCanvas, {
+  delay: delay,
+  transparent: 0,
+  disposal: 2 // Restore to background color - removes ghosting/pixel residues
+});
+```
+
+
+========================================================================================
+11. INTEGRATION INSTRUCTIONS & COMMON SAVING PITFALLS FOR ANOTHER APP
+========================================================================================
+When building SHP saving functionality for another application or game tool, follow these 
+essential rules to guarantee 100% compatibility with TS, RA2, OpenRA, and XCC:
+
+1. **Always Use Little-Endian**:
+   Every 16-bit and 32-bit field in both the Global Header and the Frame Headers must be 
+   written in little-endian. In JavaScript/TypeScript, pass `true` as the third argument 
+   to all DataView setter methods:
+   `dv.setUint16(offset, value, true)`
+   `dv.setUint32(offset, value, true)`
+
+2. **The Line Length Includes The 2-Byte Prefix**:
+   In Format 80 RLE Zero lines, the first two bytes are `lineLen`. That length MUST be 
+   `lineBytes.length + 2`. If you only write `lineBytes.length`, every line will be 2 bytes 
+   short and game decoders will crash or corrupt pixel rows.
+
+3. **Cap Zero-Run Counters At 255**:
+   Because the skip count byte is an 8-bit unsigned integer (`0..255`), you cannot skip more 
+   than 255 pixels in a single command. If a transparent run has 300 zeroes, you must write:
+   `[0, 255, 0, 45]`. Never allow `count` to exceed 255.
+
+4. **Calculate fileOffset Dynamically**:
+   Do NOT hardcode file offsets. Start `currentDataOffset` at `8 + (numFrames * 24)`. 
+   For each frame, record that offset in the frame's header, copy the compressed bytes, 
+   and advance the pointer by `encoded.length`.
+
+5. **Compression Flag Must Be 3**:
+   In the frame header (offset 8..11), write uint32 `3`. The bottom 2 bits (`flags & 0x03`) 
+   inform the game engine that this frame is compressed using Format 80 RLE Zero.
+
+6. **Never Write Zero-Dimension Frames (w = 0 or h = 0)**:
+   If a frame in an animation is completely transparent (for example, a blank delay frame or 
+   empty flash frame), never write `w = 0` or `h = 0`. Instead, set `w = 1`, `h = 1`, and a 
+   single pixel of index `0`. This encodes into a safe 4-byte line (`[0x04, 0x00, 0x00, 0x01]`) 
+   which is safely read by all game engines without divide-by-zero or memory allocation errors.
+
+7. **Maintain Global vs. Local Coordinate Separation**:
+   - `shp.width` and `shp.height` define the global canvas envelope.
+   - `frame.x` and `frame.y` define where this specific frame sits on that canvas.
+   - `frame.w` and `frame.h` are the trimmed pixel dimensions of `frame.data`.
+   `frame.data` must have exactly `frame.w * frame.h` bytes.
+
+8. **Always Treat Index 0 As Mask**:
+   Palette index 0 is strictly transparency. Never remap active artwork colors to index 0.
+
+9. **Yield To The Event Loop During Batch Operations**:
+   When encoding archives with hundreds of frames or running batch downloads, call 
+   `await new Promise(r => setTimeout(r, 0))` periodically between frames so the user 
+   interface remains responsive.
+
+========================================================================================
+END OF DOCUMENTATION SPECIAL DATA SHEET
+========================================================================================

@@ -1,0 +1,6 @@
+{
+  "name": "Remix Nectar Injector v0.0.21",
+  "description": "An intelligent image processing tool to arrange, overlay, and modify images on a canvas. Features AI-powered commands for layout management and AI-generated overlays.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
